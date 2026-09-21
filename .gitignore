@@ -1,3 +1,19 @@
 /.vs
 /CMakeSettings.json
 /hadesmem-*-*
+
+# Local CMake / install trees
+/build/
+/artifact/
+
+# Scylla / x64dbg helper binaries (scripts may remain tracked)
+/tools/*.dll
+/tools/*.exe
+/tools/*.pdb
+
+# Common MSVC leftovers if built outside /build
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk

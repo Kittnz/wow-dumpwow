@@ -21,8 +21,6 @@
     OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
     SOFTWARE.
 */
-#define _SILENCE_EXPERIMENTAL_FILESYSTEM_DEPRECATION_WARNING
-
 #include "raii_proc.hpp"
 
 #include <hadesmem/injector.hpp>
@@ -32,7 +30,13 @@
 #include <hadesmem/write.hpp>
 #include <hadesmem/pelib/pe_file.hpp>
 #include <hadesmem/pelib/tls_dir.hpp>
+#include <hadesmem/pelib/nt_headers.hpp>
+#include <hadesmem/pelib/import_dir.hpp>
+#include <hadesmem/pelib/import_dir_list.hpp>
+#include <hadesmem/pelib/import_thunk.hpp>
+#include <hadesmem/pelib/import_thunk_list.hpp>
 #include <hadesmem/find_pattern.hpp>
+#include <hadesmem/find_procedure.hpp>
 
 #include <Windows.h>
 #include <intrin.h>
@@ -40,18 +44,21 @@
 #include <iostream>
 #include <vector>
 #include <string>
-#include <experimental/filesystem>
+#include <filesystem>
 #include <thread>
 #include <chrono>
 #include <fstream>
 #include <cstdio>
 #include <atomic>
+#include <cstring>
+#include <cctype>
+#include <algorithm>
 
 #pragma intrinsic(_ReturnAddress)
 
 #define CALL_FIRST  1
 
-namespace fs = std::experimental::filesystem;
+namespace fs = std::filesystem;
 
 fs::path get_temp_filename(const fs::path& path);
 bool launch_wow_suspended(const fs::path &path,
@@ -63,6 +70,15 @@ BOOL ControlHandler(DWORD ctrl_type);
 bool FindVEHCallerRVA();
 size_t find_call_tls_initializers_rva();
 void process_log_file(const fs::path &exe_path);
+bool pe_depends_on_loader(const hadesmem::Process &process,
+    const hadesmem::PeFile &pe);
+void disable_loader_import(const hadesmem::Process &process,
+    const hadesmem::PeFile &pe, DWORD &import_rva, DWORD &import_size);
+void load_loader_and_fix_iat(const hadesmem::Process &process,
+    const hadesmem::PeFile &pe, const fs::path &exe_dir,
+    DWORD import_rva, DWORD import_size);
+DWORD get_export_rva_from_file(const fs::path &dll_path,
+    const char *export_name);
 
 size_t g_veh_caller_rva;
 std::atomic_bool g_exit_wow;
@@ -83,7 +99,7 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    const fs::path path(argv[1]);
+    const fs::path path = fs::absolute(argv[1]);
 
     try
     {
@@ -106,6 +122,21 @@ int main(int argc, char *argv[])
         std::cout << "Wow base address:       0x" << std::hex
             << reinterpret_cast<std::uintptr_t>(pe_file.GetBase())
             << std::endl;
+
+        // Modern Classic clients pull in WowClassic_loader.dll (Eidolon).
+        // InjectDll forces loader init first, which loads Eidolon and causes
+        // LoadLibraryExW(unpacker.dll) to fail. Strip that import for now.
+        DWORD loader_import_rva = 0;
+        DWORD loader_import_size = 0;
+        auto const has_loader = pe_depends_on_loader(process, pe_file);
+        if (has_loader)
+        {
+            std::cout << "Detected WowClassic_loader.dll import; "
+                << "deferring Eidolon load until after injection"
+                << std::endl;
+            disable_loader_import(process, pe_file, loader_import_rva,
+                loader_import_size);
+        }
 
         // temporarily disable TLS callbacks to prevent them from executing
         // when we inject
@@ -141,8 +172,11 @@ int main(int argc, char *argv[])
         }
 
         // with the TLS callbacks disabled, our DLL may be safely injected
+        std::cout << "Injecting unpacker.dll..." << std::endl;
         const hadesmem::Module unpacker(process, hadesmem::InjectDll(process,
-            L"unpacker.dll", hadesmem::InjectFlags::kPathResolution));
+            L"unpacker.dll",
+            hadesmem::InjectFlags::kPathResolution |
+            hadesmem::InjectFlags::kAddToSearchOrder));
 
         // call init function in DLL
         auto const func = reinterpret_cast<
@@ -152,6 +186,14 @@ int main(int argc, char *argv[])
         hadesmem::Call(process, func, hadesmem::CallConv::kDefault,
             call_tls_initializers_rva, proc_info.dwThreadId,
             pe_file.GetBase(), pe_file.GetSize());
+
+        if (has_loader)
+        {
+            std::cout << "Loading WowClassic_loader.dll and fixing IAT..."
+                << std::endl;
+            load_loader_and_fix_iat(process, pe_file, path.parent_path(),
+                loader_import_rva, loader_import_size);
+        }
 
         // restore first TLS callback
         hadesmem::Write<void *>(process, tls_callback_directory,
@@ -264,12 +306,263 @@ bool FindVEHCallerRVA()
     return *call_site == 0xFF && *(call_site + 5) == 0;
 }
 
+bool pe_depends_on_loader(const hadesmem::Process &process,
+    const hadesmem::PeFile &pe)
+{
+    try
+    {
+        hadesmem::ImportDirList dirs(process, pe);
+        for (auto const &dir : dirs)
+        {
+            auto name = dir.GetName();
+            for (auto &c : name)
+                c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+            if (name == "wowclassic_loader.dll")
+                return true;
+        }
+    }
+    catch (const std::exception &)
+    {
+    }
+
+    return false;
+}
+
+void disable_loader_import(const hadesmem::Process &process,
+    const hadesmem::PeFile &pe, DWORD &import_rva, DWORD &import_size)
+{
+    hadesmem::NtHeaders nt(process, pe);
+    import_rva = nt.GetDataDirectoryVirtualAddress(hadesmem::PeDataDir::Import);
+    import_size = nt.GetDataDirectorySize(hadesmem::PeDataDir::Import);
+    nt.SetDataDirectoryVirtualAddress(hadesmem::PeDataDir::Import, 0);
+    nt.SetDataDirectorySize(hadesmem::PeDataDir::Import, 0);
+    nt.UpdateWrite();
+}
+
+DWORD get_export_rva_from_file(const fs::path &dll_path,
+    const char *export_name)
+{
+    std::ifstream in(dll_path, std::ios::binary);
+    if (!in)
+        return 0;
+
+    IMAGE_DOS_HEADER dos {};
+    in.read(reinterpret_cast<char *>(&dos), sizeof(dos));
+    if (!in || dos.e_magic != IMAGE_DOS_SIGNATURE)
+        return 0;
+
+    in.seekg(dos.e_lfanew, std::ios::beg);
+    DWORD nt_sig = 0;
+    in.read(reinterpret_cast<char *>(&nt_sig), sizeof(nt_sig));
+    if (!in || nt_sig != IMAGE_NT_SIGNATURE)
+        return 0;
+
+    IMAGE_FILE_HEADER file_hdr {};
+    in.read(reinterpret_cast<char *>(&file_hdr), sizeof(file_hdr));
+    if (!in)
+        return 0;
+
+    IMAGE_OPTIONAL_HEADER64 opt64 {};
+    if (file_hdr.SizeOfOptionalHeader < sizeof(opt64))
+        return 0;
+    in.read(reinterpret_cast<char *>(&opt64), sizeof(opt64));
+    if (!in || opt64.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        return 0;
+
+    auto const export_rva =
+        opt64.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    auto const export_size =
+        opt64.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+    if (!export_rva || !export_size)
+        return 0;
+
+    std::vector<IMAGE_SECTION_HEADER> sections(file_hdr.NumberOfSections);
+    in.read(reinterpret_cast<char *>(sections.data()),
+        static_cast<std::streamsize>(
+            sections.size() * sizeof(IMAGE_SECTION_HEADER)));
+    if (!in)
+        return 0;
+
+    auto rva_to_offset = [&](DWORD rva) -> DWORD {
+        for (auto const &sec : sections)
+        {
+            auto const size = (std::max)(sec.SizeOfRawData, sec.Misc.VirtualSize);
+            if (rva >= sec.VirtualAddress &&
+                rva < sec.VirtualAddress + size)
+            {
+                return sec.PointerToRawData + (rva - sec.VirtualAddress);
+            }
+        }
+        return 0;
+    };
+
+    auto const export_off = rva_to_offset(export_rva);
+    if (!export_off)
+        return 0;
+
+    IMAGE_EXPORT_DIRECTORY exp {};
+    in.seekg(export_off, std::ios::beg);
+    in.read(reinterpret_cast<char *>(&exp), sizeof(exp));
+    if (!in || !exp.NumberOfNames)
+        return 0;
+
+    auto const names_off = rva_to_offset(exp.AddressOfNames);
+    auto const ords_off = rva_to_offset(exp.AddressOfNameOrdinals);
+    auto const funcs_off = rva_to_offset(exp.AddressOfFunctions);
+    if (!names_off || !ords_off || !funcs_off)
+        return 0;
+
+    std::vector<DWORD> name_rvas(exp.NumberOfNames);
+    in.seekg(names_off, std::ios::beg);
+    in.read(reinterpret_cast<char *>(name_rvas.data()),
+        static_cast<std::streamsize>(name_rvas.size() * sizeof(DWORD)));
+    if (!in)
+        return 0;
+
+    std::vector<WORD> name_ords(exp.NumberOfNames);
+    in.seekg(ords_off, std::ios::beg);
+    in.read(reinterpret_cast<char *>(name_ords.data()),
+        static_cast<std::streamsize>(name_ords.size() * sizeof(WORD)));
+    if (!in)
+        return 0;
+
+    for (DWORD i = 0; i < exp.NumberOfNames; ++i)
+    {
+        auto const name_off = rva_to_offset(name_rvas[i]);
+        if (!name_off)
+            continue;
+
+        char name_buf[256] {};
+        in.seekg(name_off, std::ios::beg);
+        in.read(name_buf, sizeof(name_buf) - 1);
+        if (!in && !in.eof())
+            continue;
+        name_buf[sizeof(name_buf) - 1] = '\0';
+
+        if (std::strcmp(name_buf, export_name) != 0)
+            continue;
+
+        auto const func_index = name_ords[i];
+        if (func_index >= exp.NumberOfFunctions)
+            return 0;
+
+        DWORD func_rva = 0;
+        in.seekg(funcs_off + func_index * sizeof(DWORD), std::ios::beg);
+        in.read(reinterpret_cast<char *>(&func_rva), sizeof(func_rva));
+        if (!in)
+            return 0;
+
+        // Skip forwarded exports (RVA lies inside the export directory).
+        if (func_rva >= export_rva && func_rva < export_rva + export_size)
+            return 0;
+
+        return func_rva;
+    }
+
+    return 0;
+}
+
+void load_loader_and_fix_iat(const hadesmem::Process &process,
+    const hadesmem::PeFile &pe, const fs::path &exe_dir,
+    DWORD import_rva, DWORD import_size)
+{
+    // Restore the import directory so we can parse descriptors/IAT again.
+    {
+        hadesmem::NtHeaders nt(process, pe);
+        nt.SetDataDirectoryVirtualAddress(hadesmem::PeDataDir::Import,
+            import_rva);
+        nt.SetDataDirectorySize(hadesmem::PeDataDir::Import, import_size);
+        nt.UpdateWrite();
+    }
+
+    auto const loader_path = exe_dir / "WowClassic_loader.dll";
+    if (!fs::exists(loader_path))
+        throw std::runtime_error("WowClassic_loader.dll not found next to exe");
+
+    auto const loader_handle = hadesmem::InjectDll(process,
+        loader_path.wstring(), hadesmem::InjectFlags::kNone);
+
+    // Resolve eidolon_run. Prefer an in-memory name lookup; hadesmem's
+    // ordinal FindProcedure only matches nameless exports, but this DLL
+    // exports ordinal 1 by name. Fall back to the on-disk export RVA if
+    // the in-memory export directory is unreadable after Eidolon init.
+    FARPROC eidolon = nullptr;
+    try
+    {
+        const hadesmem::Module loader(process, loader_handle);
+        eidolon = hadesmem::FindProcedure(process, loader, "eidolon_run");
+    }
+    catch (const std::exception &)
+    {
+        eidolon = nullptr;
+    }
+
+    if (!eidolon)
+    {
+        auto const rva = get_export_rva_from_file(loader_path, "eidolon_run");
+        if (!rva)
+            throw std::runtime_error(
+                "Failed to resolve eidolon_run in WowClassic_loader.dll");
+
+        eidolon = reinterpret_cast<FARPROC>(
+            reinterpret_cast<std::uint8_t *>(loader_handle) + rva);
+        std::cout << "Resolved eidolon_run via on-disk export RVA 0x"
+            << std::hex << rva << std::endl;
+    }
+
+    std::cout << "eidolon_run:            0x" << std::hex
+        << reinterpret_cast<std::uintptr_t>(eidolon) << std::endl;
+
+    hadesmem::ImportDirList dirs(process, pe);
+    for (auto const &dir : dirs)
+    {
+        auto name = dir.GetName();
+        for (auto &c : name)
+            c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+        if (name != "wowclassic_loader.dll")
+            continue;
+
+        // Count INT entries so we do not walk past this DLL's IAT slice into
+        // the shared obfuscated import table (null-terminated walk would
+        // overwrite hundreds of stub pointers with eidolon_run).
+        size_t loader_import_count = 0;
+        if (dir.GetOriginalFirstThunk())
+        {
+            hadesmem::ImportThunkList ilt(process, pe,
+                dir.GetOriginalFirstThunk());
+            for (auto const &t : ilt)
+            {
+                (void)t;
+                ++loader_import_count;
+            }
+        }
+
+        if (!loader_import_count)
+            loader_import_count = 1;
+
+        size_t patched = 0;
+        hadesmem::ImportThunkList thunks(process, pe, dir.GetFirstThunk());
+        for (auto thunk : thunks)
+        {
+            if (patched >= loader_import_count)
+                break;
+            thunk.SetFunction(reinterpret_cast<ULONGLONG>(eidolon));
+            thunk.UpdateWrite();
+            ++patched;
+        }
+
+        std::cout << "Patched " << std::dec << patched
+            << " WowClassic_loader IAT entr"
+            << (patched == 1 ? "y" : "ies") << std::endl;
+        break;
+    }
+}
+
 bool launch_wow_suspended(const fs::path &path,
     PROCESS_INFORMATION &proc_info)
 {
-    // disable ASLR for subprocesses.  this will cause the base address used
-    // in memory to match the base address that static analysis tools will use
-    SIZE_T cb;
+    // disable ASLR for subprocesses so the base address matches static tools
+    SIZE_T cb = 0;
     if (!::InitializeProcThreadAttributeList(nullptr, 1, 0, &cb) &&
         ::GetLastError() != ERROR_INSUFFICIENT_BUFFER)
         return false;
@@ -291,22 +584,31 @@ bool launch_wow_suspended(const fs::path &path,
         PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &attribute, sizeof(DWORD64),
         nullptr, nullptr))
     {
+        ::DeleteProcThreadAttributeList(attribs);
         free(attribs);
         return false;
     }
 
-    // launch wow in a suspended state
-    STARTUPINFO start_info {};
-    start_info.cb = static_cast<DWORD>(sizeof(start_info));
+    STARTUPINFOEXW start_info {};
+    start_info.StartupInfo.cb = static_cast<DWORD>(sizeof(start_info));
+    start_info.lpAttributeList = attribs;
     memset(&proc_info, 0, sizeof(proc_info));
 
-    wchar_t path_raw[MAX_PATH];
-    memcpy(&path_raw[0], path.wstring().c_str(),
-        (1 + path.wstring().length()) * sizeof(wchar_t));
+    auto path_w = path.wstring();
+    std::vector<wchar_t> path_raw(path_w.begin(), path_w.end());
+    path_raw.push_back(L'\0');
 
-    auto const result = !!::CreateProcessW(path_raw, nullptr, nullptr,
-        nullptr, FALSE, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
-        nullptr, nullptr, &start_info, &proc_info);
+    auto const dir_w = path.parent_path().wstring();
+
+    auto const result = !!::CreateProcessW(path_raw.data(), nullptr, nullptr,
+        nullptr, FALSE,
+        CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT |
+            EXTENDED_STARTUPINFO_PRESENT,
+        nullptr, dir_w.empty() ? nullptr : dir_w.c_str(),
+        &start_info.StartupInfo, &proc_info);
+
+    ::DeleteProcThreadAttributeList(attribs);
+    free(attribs);
 
     return result;
 }

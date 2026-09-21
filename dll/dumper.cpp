@@ -31,6 +31,7 @@
 #include "log.hpp"
 #include "imports.hpp"
 #include "relocations.hpp"
+#include "iat_deobfuscate.hpp"
 
 #include <hadesmem/region.hpp>
 #include <hadesmem/region_list.hpp>
@@ -44,13 +45,18 @@
 #include <Windows.h>
 
 #include <stdexcept>
-#include <experimental/filesystem>
+#include <filesystem>
 #include <fstream>
 #include <vector>
 #include <cstring>
 #include <cassert>
+#include <algorithm>
+#include <iomanip>
 
-namespace fs = std::experimental::filesystem;
+namespace fs = std::filesystem;
+
+// Remapped image base from the last successful dump (for Scylla).
+PVOID g_last_remapped_base = nullptr;
 
 fs::path get_output_path(const fs::path& input_path);
 PVOID find_remapped_base(const hadesmem::Process& process, PVOID base);
@@ -67,6 +73,7 @@ void do_dump(PVOID base, DWORD pe_size)
 
     // this will let us work with the writable part of memory
     base = find_remapped_base(process, base);
+    g_last_remapped_base = base;
 
     // memory_pe will hold the PE header data before any changes were made
     std::vector<std::uint8_t> memory_pe(pe_size);
@@ -124,7 +131,11 @@ PVOID find_remapped_base(const hadesmem::Process& process, PVOID base)
     const hadesmem::PeFile pe_file(process, base, hadesmem::PeFileType::kImage,
         0);
 
-    // find the PE header in the remapped location
+    gLog << "Image size: 0x" << std::hex << pe_file.GetSize() << std::endl;
+    gLog << "Searching for remapped copy of 0x" << std::hex
+        << reinterpret_cast<std::uintptr_t>(base) << std::endl;
+
+    // Prefer an exact-size duplicate of the image (classic remap behaviour).
     for (auto const& region : region_list)
     {
         if (region.GetState() == MEM_FREE)
@@ -136,15 +147,50 @@ PVOID find_remapped_base(const hadesmem::Process& process, PVOID base)
         if (region.GetSize() != pe_file.GetSize())
             continue;
 
-        if (memcmp(base, region.GetBase(), region.GetSize()))
+        if (region.GetBase() == base)
             continue;
 
-#ifdef _DEBUG
-        gLog << "Remapped base:\t\t0x" << std::hex << region.GetBase()
-            << " protection: 0x" << region.GetProtect()
-            << " size: 0x" << region.GetSize() << std::endl;
-#endif
+        if (memcmp(base, region.GetBase(),
+            (std::min)(static_cast<SIZE_T>(0x1000), region.GetSize())))
+            continue;
 
+        gLog << "Remapped base: 0x" << std::hex
+            << reinterpret_cast<std::uintptr_t>(region.GetBase())
+            << " protect: 0x" << region.GetProtect()
+            << " size: 0x" << region.GetSize() << std::endl;
+
+        return region.GetBase();
+    }
+
+    // Fallback: writable region whose first page matches the image header.
+    for (auto const& region : region_list)
+    {
+        if (region.GetState() != MEM_COMMIT)
+            continue;
+        if (region.GetAllocBase() != region.GetBase())
+            continue;
+        if (region.GetBase() == base)
+            continue;
+        if (region.GetSize() < 0x1000)
+            continue;
+
+        auto const protect = region.GetProtect();
+        auto const writable =
+            protect == PAGE_READWRITE ||
+            protect == PAGE_EXECUTE_READWRITE ||
+            protect == PAGE_WRITECOPY ||
+            protect == PAGE_EXECUTE_WRITECOPY;
+
+        if (!writable)
+            continue;
+
+        if (memcmp(base, region.GetBase(), 0x200))
+            continue;
+
+        gLog << "Fallback remapped base: 0x" << std::hex
+            << reinterpret_cast<std::uintptr_t>(region.GetBase())
+            << " protect: 0x" << protect
+            << " size: 0x" << region.GetSize() << std::endl;
         return region.GetBase();
     }
 
@@ -288,6 +334,10 @@ void repair_binary(const fs::path &path, const hadesmem::Process &process,
 
         gLog << "True entry point:\t0x" << std::hex << new_ep << std::endl;
     }
+
+    // Deobfuscate modern Blizzard IAT trampolines in the remapped image so
+    // slots hold absolute API addresses before we rebuild the import dir.
+    deobfuscate_import_address_table(process, base, pe_file);
 
     // the second TLS callback will generate simple pointer decryption
     // trampolines to mask calls to imported DLL functions.  to resolve

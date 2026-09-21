@@ -29,6 +29,7 @@
 
 #include <hadesmem/process.hpp>
 #include <hadesmem/region.hpp>
+#include <hadesmem/module.hpp>
 #include <hadesmem/module_list.hpp>
 #include <hadesmem/pelib/section.hpp>
 #include <hadesmem/pelib/section_list.hpp>
@@ -37,6 +38,7 @@
 #include <hadesmem/pelib/import_dir_list.hpp>
 #include <hadesmem/pelib/import_thunk.hpp>
 #include <hadesmem/pelib/import_thunk_list.hpp>
+#include <hadesmem/pelib/nt_headers.hpp>
 
 #include <Windows.h>
 
@@ -129,19 +131,11 @@ class ImportTable
             if (!_import_dirs.empty() && _import_dirs.back().name == mod_name)
                 return _import_dirs.back();
 
-            // if the import directory for this library exists anywhere else,
-            // it means we have made a mistake somewhere along the way.
+            // Re-open an earlier directory for this module when imports are
+            // interleaved (e.g. ntdll after KERNEL32 forwards).
             for (auto& import_dir : _import_dirs)
                 if (mod_name == import_dir.name)
-                {
-                    gLog << "Import directory for 0x" << std::hex
-                        << reinterpret_cast<std::uintptr_t>(function)
-                        << " module \"" << mod_name
-                        << "\" has already been finalized" << std::endl;
-                    gLog << " alloc base: " << region.GetAllocBase() << std::endl;
-                    throw std::runtime_error(
-                        "Import directory ordering failure");
-                }
+                    return import_dir;
 
             // create a new empty import directory for this module
             IMAGE_IMPORT_DESCRIPTOR imp_dir;
@@ -405,6 +399,8 @@ void rebuild_imports(const hadesmem::Process &process,
     const hadesmem::Region import_region(process, rdata);
 
     auto const base = import_region.GetAllocBase();
+    auto const image_base = reinterpret_cast<std::uintptr_t>(pe_file.GetBase());
+    auto const image_end = image_base + pe_file.GetSize();
 
     auto const rdata_va = static_cast<DWORD>(
         reinterpret_cast<std::uintptr_t>(rdata) -
@@ -414,34 +410,54 @@ void rebuild_imports(const hadesmem::Process &process,
     ImportTable import_table(pe_file, new_section.GetVirtualAddress(),
         rdata_va);
 
-    auto const import_region_end = reinterpret_cast<PVOID>(
+    // Prefer the PE IAT directory when deobfuscation populated it.
+    auto *scan_begin = reinterpret_cast<PVOID *>(rdata);
+    auto *scan_end = reinterpret_cast<PVOID *>(
         reinterpret_cast<std::uintptr_t>(import_region.GetBase()) +
         import_region.GetSize());
 
-    // when true, the next function will force creation of a new import
-    // directory
-    auto force_new_import_dir = true;
+    try
+    {
+        hadesmem::NtHeaders nt(process, pe_file);
+        auto const iat_rva =
+            nt.GetDataDirectoryVirtualAddress(hadesmem::PeDataDir::IAT);
+        auto const iat_size =
+            nt.GetDataDirectorySize(hadesmem::PeDataDir::IAT);
+        if (iat_rva && iat_size >= sizeof(PVOID))
+        {
+            auto const iat_ea = reinterpret_cast<PVOID *>(
+                image_base + iat_rva);
+            auto const iat_ea_end = reinterpret_cast<PVOID *>(
+                reinterpret_cast<std::uintptr_t>(iat_ea) + iat_size);
+            if (iat_ea >= scan_begin && iat_ea_end <= scan_end)
+            {
+                scan_begin = iat_ea;
+                scan_end = iat_ea_end;
+                gLog << "rebuild_imports: using IAT directory 0x" << std::hex
+                    << iat_rva << " size 0x" << iat_size << std::endl;
+            }
+        }
+    }
+    catch (const std::exception &)
+    {
+    }
 
-    // step two, iterate over .rdata section and decrypt encrypted trampolines
-    for (auto current_import =
-        reinterpret_cast<PVOID *>(rdata);
-        current_import < import_region_end;
+    auto force_new_import_dir = true;
+    size_t resolved_count = 0;
+    size_t skipped_count = 0;
+
+    auto is_likely_ptr = [](std::uintptr_t p) {
+        if (p < 0x10000ULL)
+            return false;
+        auto const top = p >> 48;
+        return top == 0 || top == 0xFFFFULL;
+    };
+
+    for (auto current_import = scan_begin;
+        current_import < scan_end;
         ++current_import)
     {
         auto const thunk_ea = *current_import;
-
-        auto const import_rva = static_cast<DWORD>(
-            reinterpret_cast<std::uintptr_t>(current_import) -
-            reinterpret_cast<std::uintptr_t>(pe_file.GetBase()));
-        auto const thunk_rva = static_cast<DWORD>(
-            reinterpret_cast<std::uintptr_t>(thunk_ea) -
-            reinterpret_cast<std::uintptr_t>(pe_file.GetBase()));
-
-#ifdef _DEBUG
-        gLog << "Import RVA: +0x" << std::hex << import_rva << " Thunk EA: 0x"
-            << reinterpret_cast<std::uintptr_t>(thunk_ea) << " Thunk RVA: +0x"
-            << thunk_rva << std::endl;
-#endif
 
         if (!thunk_ea)
         {
@@ -449,72 +465,89 @@ void rebuild_imports(const hadesmem::Process &process,
             continue;
         }
 
-        // if the thunk ea is not sane, skip it.  this heuristic is not
-        // necessary but greatly speeds up the process.  without it, each
-        // of these addresses would be examined and result in an exception
-        // when hadesmem calls VirtualQueryEx() and it fails.
-        if (reinterpret_cast<std::uint64_t>(thunk_ea) >> 0x30)
-        {
-            gLog << "Bad thunk ea RVA: 0x" << std::hex << import_rva << " thunk_ea: 0x"
-                << std::hex << reinterpret_cast<std::uintptr_t>(thunk_ea)
-                << std::endl;
+        auto const thunk_val =
+            reinterpret_cast<std::uintptr_t>(thunk_ea);
 
+        if (!is_likely_ptr(thunk_val))
+        {
+            ++skipped_count;
             continue;
         }
 
         try
         {
+            // Already-resolved absolute API (outside our image)?
+            if (thunk_val < image_base || thunk_val >= image_end)
+            {
+                const hadesmem::Region thunk_region(process, thunk_ea);
+                if (thunk_region.GetType() == MEM_IMAGE &&
+                    (thunk_region.GetProtect() == PAGE_EXECUTE ||
+                     thunk_region.GetProtect() == PAGE_EXECUTE_READ ||
+                     thunk_region.GetProtect() == PAGE_EXECUTE_READWRITE ||
+                     thunk_region.GetProtect() == PAGE_EXECUTE_WRITECOPY))
+                {
+                    import_table.add_function(current_import, thunk_ea,
+                        force_new_import_dir);
+                    force_new_import_dir = false;
+                    ++resolved_count;
+                    continue;
+                }
+            }
+
             const hadesmem::Region thunk_region(process, thunk_ea);
 
             if (thunk_region.GetType() == MEM_FREE)
+            {
+                ++skipped_count;
                 continue;
+            }
 
             if (thunk_region.GetProtect() == PAGE_EXECUTE)
             {
                 auto const rva = static_cast<DWORD>(
                     reinterpret_cast<std::uintptr_t>(current_import) -
-                    reinterpret_cast<std::uintptr_t>(pe_file.GetBase()));
+                    image_base);
 
                 gLog << "[Import Resolution]: Skipping import from +0x"
                     << std::hex << rva << " because it points to unreadble "
                     "PAGE_EXECUTE memory.  If you see this, please file a bug."
                     << std::endl;
 
+                ++skipped_count;
                 continue;
             }
 
             if (thunk_region.GetProtect() != PAGE_EXECUTE_READ &&
                 thunk_region.GetProtect() != PAGE_EXECUTE_READWRITE &&
                 thunk_region.GetProtect() != PAGE_EXECUTE_WRITECOPY)
+            {
+                ++skipped_count;
                 continue;
+            }
 
             ConclicThreadContext ctx;
 
             if (!conclic_begin(thunk_ea, ctx))
             {
-#ifdef _DEBUG
-                gLog << "concolic failed RVA: 0x" << std::hex << import_rva << " thunk_ea: 0x"
-                    << std::hex << reinterpret_cast<std::uintptr_t>(thunk_ea)
-                    << std::endl;
-#endif
+                ++skipped_count;
                 continue;
             }
 
-            // the ImportTable class will build import directory entries as
-            // needed for eventual serialization
             import_table.add_function(current_import,
                 reinterpret_cast<PVOID>(ctx.rax), force_new_import_dir);
 
             force_new_import_dir = false;
+            ++resolved_count;
         }
-        catch (const std::exception &e)
+        catch (const std::exception &)
         {
-#ifdef _DEBUG
-            gLog << "Exception: " << boost::diagnostic_information(e) << std::endl;
-#endif
-            break;
+            ++skipped_count;
+            continue;
         }
     }
+
+    gLog << "rebuild_imports: resolved=" << std::dec << resolved_count
+        << " skipped=" << skipped_count << std::endl;
 
     // serialize the import table into memory in preparation for dumping to
     // the disk

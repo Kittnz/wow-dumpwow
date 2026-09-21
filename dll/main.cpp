@@ -130,25 +130,41 @@ std::uint64_t BaseThreadInitThunkHook(hadesmem::PatchDetourBase *detour,
             return detour->GetTrampolineT<BaseThreadInitThunkT>()(a1, func,
                 a3);
 
-        if (*reinterpret_cast<std::uint8_t *>(entry_point) != 0xE9)
-            throw std::runtime_error(
-                "Entry point should start with a JMP (0xE9)");
+        auto const ep_bytes = reinterpret_cast<std::uint8_t *>(entry_point);
+        gLog << "Entry point hit: 0x" << std::hex
+            << reinterpret_cast<std::uintptr_t>(entry_point)
+            << " bytes:";
+        for (int i = 0; i < 16; ++i)
+            gLog << ' ' << std::setw(2) << std::setfill('0') << std::hex
+                << static_cast<unsigned>(ep_bytes[i]);
+        gLog << std::endl;
 
+        // Older clients used a JMP stub (0xE9) here. Modern Eidolon-packed
+        // Classic builds often still have encrypted/obfuscated EP bytes at
+        // this point — dump regardless.
         try
         {
             detour->Remove();
+            gLog << "Dumping..." << std::endl;
             do_dump(base, pe_size);
+            gLog << "Dump complete" << std::endl;
         }
         catch (const std::exception &e)
         {
-            ::MessageBoxA(nullptr, boost::diagnostic_information(e).c_str(),
-                "Unpacker Error", MB_ICONERROR);
+            gLog << "Unpacker Error: "
+                << boost::diagnostic_information(e) << std::endl;
         }
     }
     catch (const std::exception &e)
     {
-        ::MessageBoxA(nullptr, boost::diagnostic_information(e).c_str(),
-            "BaseThreadInitThunk Error", MB_ICONERROR);
+        try
+        {
+            gLog << "BaseThreadInitThunk Error: "
+                << boost::diagnostic_information(e) << std::endl;
+        }
+        catch (...)
+        {
+        }
     }
 
     ::TerminateProcess(::GetCurrentProcess(), 0);
