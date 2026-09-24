@@ -22,6 +22,7 @@
     SOFTWARE.
 */
 #include "raii_proc.hpp"
+#include "memdump.hpp"
 
 #include <hadesmem/injector.hpp>
 #include <hadesmem/region_list.hpp>
@@ -70,12 +71,14 @@ BOOL ControlHandler(DWORD ctrl_type);
 bool FindVEHCallerRVA();
 size_t find_call_tls_initializers_rva();
 void process_log_file(const fs::path &exe_path);
-bool pe_depends_on_loader(const hadesmem::Process &process,
+// Returns lowercase import name (e.g. "wowb_loader.dll") or empty if none.
+std::string find_eidolon_loader_import(const hadesmem::Process &process,
     const hadesmem::PeFile &pe);
 void disable_loader_import(const hadesmem::Process &process,
     const hadesmem::PeFile &pe, DWORD &import_rva, DWORD &import_size);
 void load_loader_and_fix_iat(const hadesmem::Process &process,
     const hadesmem::PeFile &pe, const fs::path &exe_dir,
+    const std::string &loader_import_name,
     DWORD import_rva, DWORD import_size);
 DWORD get_export_rva_from_file(const fs::path &dll_path,
     const char *export_name);
@@ -85,10 +88,38 @@ std::atomic_bool g_exit_wow;
 
 int main(int argc, char *argv[])
 {
-    if (argc != 2)
+    bool force_inject = false;
+    char const *exe_arg = nullptr;
+    for (int i = 1; i < argc; ++i)
     {
-        std::cerr << "Usage: " << argv[0] << " <wow.exe>" << std::endl;
+        if (std::strcmp(argv[i], "--inject") == 0)
+            force_inject = true;
+        else if (!exe_arg)
+            exe_arg = argv[i];
+        else
+        {
+            std::cerr << "Usage: " << argv[0]
+                << " [--inject] <wow.exe>" << std::endl;
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (!exe_arg)
+    {
+        std::cerr << "Usage: " << argv[0]
+            << " [--inject] <wow.exe>" << std::endl;
         return EXIT_FAILURE;
+    }
+
+    const fs::path path = fs::absolute(exe_arg);
+
+    // Eidolon (*_loader.dll) skips .text decrypt under injected unpacker.
+    // Decrypt + remote IAT rebuild from outside (stubs need the target PEB).
+    if (!force_inject && memdump::disk_has_eidolon_loader(path))
+    {
+        std::cout << "Detected Eidolon loader import; using external memdump"
+            << std::endl;
+        return memdump::run(path);
     }
 
     auto const call_tls_initializers_rva = find_call_tls_initializers_rva();
@@ -98,8 +129,6 @@ int main(int argc, char *argv[])
         std::cerr << "Failed to find LdrpCallTlsInitializers" << std::endl;
         return EXIT_FAILURE;
     }
-
-    const fs::path path = fs::absolute(argv[1]);
 
     try
     {
@@ -123,15 +152,16 @@ int main(int argc, char *argv[])
             << reinterpret_cast<std::uintptr_t>(pe_file.GetBase())
             << std::endl;
 
-        // Modern Classic clients pull in WowClassic_loader.dll (Eidolon).
-        // InjectDll forces loader init first, which loads Eidolon and causes
+        // Modern Classic clients pull in *_loader.dll (Eidolon), e.g.
+        // WowClassic_loader.dll / WowB_loader.dll. InjectDll forces loader
+        // init first, which loads Eidolon and causes
         // LoadLibraryExW(unpacker.dll) to fail. Strip that import for now.
         DWORD loader_import_rva = 0;
         DWORD loader_import_size = 0;
-        auto const has_loader = pe_depends_on_loader(process, pe_file);
-        if (has_loader)
+        auto const loader_import = find_eidolon_loader_import(process, pe_file);
+        if (!loader_import.empty())
         {
-            std::cout << "Detected WowClassic_loader.dll import; "
+            std::cout << "Detected " << loader_import << " import; "
                 << "deferring Eidolon load until after injection"
                 << std::endl;
             disable_loader_import(process, pe_file, loader_import_rva,
@@ -187,12 +217,12 @@ int main(int argc, char *argv[])
             call_tls_initializers_rva, proc_info.dwThreadId,
             pe_file.GetBase(), pe_file.GetSize());
 
-        if (has_loader)
+        if (!loader_import.empty())
         {
-            std::cout << "Loading WowClassic_loader.dll and fixing IAT..."
-                << std::endl;
+            std::cout << "Loading " << loader_import
+                << " and fixing IAT..." << std::endl;
             load_loader_and_fix_iat(process, pe_file, path.parent_path(),
-                loader_import_rva, loader_import_size);
+                loader_import, loader_import_rva, loader_import_size);
         }
 
         // restore first TLS callback
@@ -306,7 +336,7 @@ bool FindVEHCallerRVA()
     return *call_site == 0xFF && *(call_site + 5) == 0;
 }
 
-bool pe_depends_on_loader(const hadesmem::Process &process,
+std::string find_eidolon_loader_import(const hadesmem::Process &process,
     const hadesmem::PeFile &pe)
 {
     try
@@ -317,15 +347,19 @@ bool pe_depends_on_loader(const hadesmem::Process &process,
             auto name = dir.GetName();
             for (auto &c : name)
                 c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
-            if (name == "wowclassic_loader.dll")
-                return true;
+            // WowClassic_loader.dll, WowB_loader.dll, etc.
+            auto const suffix = std::string("_loader.dll");
+            if (name.size() > suffix.size() &&
+                name.compare(name.size() - suffix.size(), suffix.size(),
+                    suffix) == 0)
+                return name;
         }
     }
     catch (const std::exception &)
     {
     }
 
-    return false;
+    return {};
 }
 
 void disable_loader_import(const hadesmem::Process &process,
@@ -462,8 +496,98 @@ DWORD get_export_rva_from_file(const fs::path &dll_path,
     return 0;
 }
 
+DWORD get_export_rva_by_ordinal_from_file(const fs::path &dll_path,
+    WORD ordinal)
+{
+    std::ifstream in(dll_path, std::ios::binary);
+    if (!in)
+        return 0;
+
+    IMAGE_DOS_HEADER dos {};
+    in.read(reinterpret_cast<char *>(&dos), sizeof(dos));
+    if (!in || dos.e_magic != IMAGE_DOS_SIGNATURE)
+        return 0;
+
+    in.seekg(dos.e_lfanew, std::ios::beg);
+    DWORD nt_sig = 0;
+    in.read(reinterpret_cast<char *>(&nt_sig), sizeof(nt_sig));
+    if (!in || nt_sig != IMAGE_NT_SIGNATURE)
+        return 0;
+
+    IMAGE_FILE_HEADER file_hdr {};
+    in.read(reinterpret_cast<char *>(&file_hdr), sizeof(file_hdr));
+    if (!in)
+        return 0;
+
+    IMAGE_OPTIONAL_HEADER64 opt64 {};
+    if (file_hdr.SizeOfOptionalHeader < sizeof(opt64))
+        return 0;
+    in.read(reinterpret_cast<char *>(&opt64), sizeof(opt64));
+    if (!in || opt64.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        return 0;
+
+    auto const export_rva =
+        opt64.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    auto const export_size =
+        opt64.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+    if (!export_rva || !export_size)
+        return 0;
+
+    std::vector<IMAGE_SECTION_HEADER> sections(file_hdr.NumberOfSections);
+    in.read(reinterpret_cast<char *>(sections.data()),
+        static_cast<std::streamsize>(
+            sections.size() * sizeof(IMAGE_SECTION_HEADER)));
+    if (!in)
+        return 0;
+
+    auto rva_to_offset = [&](DWORD rva) -> DWORD {
+        for (auto const &sec : sections)
+        {
+            auto const size = (std::max)(sec.SizeOfRawData, sec.Misc.VirtualSize);
+            if (rva >= sec.VirtualAddress &&
+                rva < sec.VirtualAddress + size)
+            {
+                return sec.PointerToRawData + (rva - sec.VirtualAddress);
+            }
+        }
+        return 0;
+    };
+
+    auto const export_off = rva_to_offset(export_rva);
+    if (!export_off)
+        return 0;
+
+    IMAGE_EXPORT_DIRECTORY exp {};
+    in.seekg(export_off, std::ios::beg);
+    in.read(reinterpret_cast<char *>(&exp), sizeof(exp));
+    if (!in || !exp.NumberOfFunctions)
+        return 0;
+
+    if (ordinal < exp.Base)
+        return 0;
+    auto const index = static_cast<DWORD>(ordinal - exp.Base);
+    if (index >= exp.NumberOfFunctions)
+        return 0;
+
+    auto const funcs_off = rva_to_offset(exp.AddressOfFunctions);
+    if (!funcs_off)
+        return 0;
+
+    DWORD func_rva = 0;
+    in.seekg(funcs_off + index * sizeof(DWORD), std::ios::beg);
+    in.read(reinterpret_cast<char *>(&func_rva), sizeof(func_rva));
+    if (!in || !func_rva)
+        return 0;
+
+    if (func_rva >= export_rva && func_rva < export_rva + export_size)
+        return 0;
+
+    return func_rva;
+}
+
 void load_loader_and_fix_iat(const hadesmem::Process &process,
     const hadesmem::PeFile &pe, const fs::path &exe_dir,
+    const std::string &loader_import_name,
     DWORD import_rva, DWORD import_size)
 {
     // Restore the import directory so we can parse descriptors/IAT again.
@@ -475,17 +599,30 @@ void load_loader_and_fix_iat(const hadesmem::Process &process,
         nt.UpdateWrite();
     }
 
-    auto const loader_path = exe_dir / "WowClassic_loader.dll";
-    if (!fs::exists(loader_path))
-        throw std::runtime_error("WowClassic_loader.dll not found next to exe");
+    // Prefer an on-disk file whose name matches the import (case-insensitive).
+    fs::path loader_path;
+    for (auto const &entry : fs::directory_iterator(exe_dir))
+    {
+        if (!entry.is_regular_file())
+            continue;
+        auto fname = entry.path().filename().string();
+        for (auto &c : fname)
+            c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+        if (fname == loader_import_name)
+        {
+            loader_path = entry.path();
+            break;
+        }
+    }
+
+    if (loader_path.empty())
+        throw std::runtime_error(
+            loader_import_name + " not found next to exe");
 
     auto const loader_handle = hadesmem::InjectDll(process,
         loader_path.wstring(), hadesmem::InjectFlags::kNone);
 
-    // Resolve eidolon_run. Prefer an in-memory name lookup; hadesmem's
-    // ordinal FindProcedure only matches nameless exports, but this DLL
-    // exports ordinal 1 by name. Fall back to the on-disk export RVA if
-    // the in-memory export directory is unreadable after Eidolon init.
+    // Resolve entry: named eidolon_run (Classic) or ordinal 1 (Beta / unnamed).
     FARPROC eidolon = nullptr;
     try
     {
@@ -499,14 +636,16 @@ void load_loader_and_fix_iat(const hadesmem::Process &process,
 
     if (!eidolon)
     {
-        auto const rva = get_export_rva_from_file(loader_path, "eidolon_run");
+        auto rva = get_export_rva_from_file(loader_path, "eidolon_run");
+        if (!rva)
+            rva = get_export_rva_by_ordinal_from_file(loader_path, 1);
         if (!rva)
             throw std::runtime_error(
-                "Failed to resolve eidolon_run in WowClassic_loader.dll");
+                "Failed to resolve eidolon entry in " + loader_import_name);
 
         eidolon = reinterpret_cast<FARPROC>(
             reinterpret_cast<std::uint8_t *>(loader_handle) + rva);
-        std::cout << "Resolved eidolon_run via on-disk export RVA 0x"
+        std::cout << "Resolved loader entry via on-disk export RVA 0x"
             << std::hex << rva << std::endl;
     }
 
@@ -519,7 +658,7 @@ void load_loader_and_fix_iat(const hadesmem::Process &process,
         auto name = dir.GetName();
         for (auto &c : name)
             c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
-        if (name != "wowclassic_loader.dll")
+        if (name != loader_import_name)
             continue;
 
         // Count INT entries so we do not walk past this DLL's IAT slice into
@@ -552,7 +691,7 @@ void load_loader_and_fix_iat(const hadesmem::Process &process,
         }
 
         std::cout << "Patched " << std::dec << patched
-            << " WowClassic_loader IAT entr"
+            << " " << loader_import_name << " IAT entr"
             << (patched == 1 ? "y" : "ies") << std::endl;
         break;
     }

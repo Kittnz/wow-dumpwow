@@ -383,7 +383,17 @@ size_t deobfuscate_import_address_table(const hadesmem::Process & /*process*/,
     gLog << "IAT deobf: scanning " << std::dec << count
         << " entries at 0x" << std::hex << iat_ea << std::endl;
 
+    for (size_t sample = 0; sample < (std::min)(count, size_t{4}); ++sample)
+    {
+        gLog << "  IAT[" << std::dec << sample << "]=0x" << std::hex
+            << entries[sample] << std::endl;
+    }
+
     auto resolve_stub_ptr = [&](std::uint64_t val) -> const void * {
+        // Beta IAT often stores RVAs (stub offset within the image).
+        if (val && val < image_size)
+            return reinterpret_cast<const void *>(image_base + val);
+
         try
         {
             const hadesmem::Process proc(::GetCurrentProcessId());
@@ -438,9 +448,21 @@ size_t deobfuscate_import_address_table(const hadesmem::Process & /*process*/,
         {
             if (i < 4)
             {
+                auto const b = reinterpret_cast<const std::uint8_t *>(stub);
                 gLog << "  deobf fail IAT[" << std::dec << i << "] stub=0x"
                     << std::hex << reinterpret_cast<std::uintptr_t>(stub)
-                    << std::endl;
+                    << " bytes:";
+                MEMORY_BASIC_INFORMATION mbi {};
+                if (::VirtualQuery(stub, &mbi, sizeof(mbi)) &&
+                    mbi.State == MEM_COMMIT)
+                {
+                    for (int n = 0; n < 24; ++n)
+                        gLog << ' ' << std::setw(2) << std::setfill('0')
+                            << static_cast<unsigned>(b[n]);
+                }
+                else
+                    gLog << " <unreadable>";
+                gLog << std::endl;
             }
             ++failed;
             continue;

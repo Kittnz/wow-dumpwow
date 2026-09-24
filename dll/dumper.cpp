@@ -45,6 +45,7 @@
 #include <Windows.h>
 
 #include <stdexcept>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <vector>
@@ -71,8 +72,35 @@ void do_dump(PVOID base, DWORD pe_size)
 
     const hadesmem::Process process(::GetCurrentProcessId());
 
-    // this will let us work with the writable part of memory
-    base = find_remapped_base(process, base);
+    // Beta packers may finish remapping / IAT stub emission after EP.
+    PVOID remapped = nullptr;
+    std::exception_ptr last_err;
+    for (int attempt = 0; attempt < 20; ++attempt)
+    {
+        if (attempt > 0)
+            ::Sleep(500);
+        try
+        {
+            remapped = find_remapped_base(process, base);
+            // Prefer a real remapped RW image when it appears later.
+            if (remapped != base || attempt >= 6)
+                break;
+            remapped = nullptr;
+            last_err = nullptr;
+        }
+        catch (const std::exception &)
+        {
+            last_err = std::current_exception();
+            remapped = nullptr;
+        }
+    }
+    if (!remapped)
+    {
+        // Fall through to in-place protect path inside find_remapped_base.
+        remapped = find_remapped_base(process, base);
+    }
+
+    base = remapped;
     g_last_remapped_base = base;
 
     // memory_pe will hold the PE header data before any changes were made
@@ -131,9 +159,38 @@ PVOID find_remapped_base(const hadesmem::Process& process, PVOID base)
     const hadesmem::PeFile pe_file(process, base, hadesmem::PeFileType::kImage,
         0);
 
-    gLog << "Image size: 0x" << std::hex << pe_file.GetSize() << std::endl;
+    auto const image_size = pe_file.GetSize();
+    gLog << "Image size: 0x" << std::hex << image_size << std::endl;
     gLog << "Searching for remapped copy of 0x" << std::hex
         << reinterpret_cast<std::uintptr_t>(base) << std::endl;
+
+    auto pe_header_looks_like = [](PVOID candidate) -> bool {
+        MEMORY_BASIC_INFORMATION mbi {};
+        if (!::VirtualQuery(candidate, &mbi, sizeof(mbi)) ||
+            mbi.State != MEM_COMMIT ||
+            mbi.RegionSize < sizeof(IMAGE_DOS_HEADER))
+            return false;
+
+        auto const dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(candidate);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+            return false;
+        if (dos->e_lfanew <= 0 ||
+            static_cast<SIZE_T>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) >
+                mbi.RegionSize)
+            return false;
+
+        auto const nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(
+            reinterpret_cast<const std::uint8_t *>(candidate) + dos->e_lfanew);
+        return nt->Signature == IMAGE_NT_SIGNATURE;
+    };
+
+    auto is_writable = [](DWORD protect) {
+        protect &= 0xFF;
+        return protect == PAGE_READWRITE ||
+            protect == PAGE_EXECUTE_READWRITE ||
+            protect == PAGE_WRITECOPY ||
+            protect == PAGE_EXECUTE_WRITECOPY;
+    };
 
     // Prefer an exact-size duplicate of the image (classic remap behaviour).
     for (auto const& region : region_list)
@@ -144,7 +201,7 @@ PVOID find_remapped_base(const hadesmem::Process& process, PVOID base)
         if (region.GetAllocBase() != region.GetBase())
             continue;
 
-        if (region.GetSize() != pe_file.GetSize())
+        if (region.GetSize() != image_size)
             continue;
 
         if (region.GetBase() == base)
@@ -162,7 +219,10 @@ PVOID find_remapped_base(const hadesmem::Process& process, PVOID base)
         return region.GetBase();
     }
 
-    // Fallback: writable region whose first page matches the image header.
+    // Fallback: large writable allocation with a PE header (beta may remap
+    // with a different region size than SizeOfImage).
+    PVOID best = nullptr;
+    SIZE_T best_size = 0;
     for (auto const& region : region_list)
     {
         if (region.GetState() != MEM_COMMIT)
@@ -171,31 +231,73 @@ PVOID find_remapped_base(const hadesmem::Process& process, PVOID base)
             continue;
         if (region.GetBase() == base)
             continue;
-        if (region.GetSize() < 0x1000)
+        if (region.GetSize() < 0x10000)
+            continue;
+        if (!is_writable(region.GetProtect()))
+            continue;
+        if (!pe_header_looks_like(region.GetBase()))
             continue;
 
-        auto const protect = region.GetProtect();
-        auto const writable =
-            protect == PAGE_READWRITE ||
-            protect == PAGE_EXECUTE_READWRITE ||
-            protect == PAGE_WRITECOPY ||
-            protect == PAGE_EXECUTE_WRITECOPY;
-
-        if (!writable)
-            continue;
-
-        if (memcmp(base, region.GetBase(), 0x200))
-            continue;
-
-        gLog << "Fallback remapped base: 0x" << std::hex
+        gLog << "Candidate remap: 0x" << std::hex
             << reinterpret_cast<std::uintptr_t>(region.GetBase())
-            << " protect: 0x" << protect
+            << " protect: 0x" << region.GetProtect()
             << " size: 0x" << region.GetSize() << std::endl;
-        return region.GetBase();
+
+        if (region.GetSize() >= image_size / 2 &&
+            region.GetSize() > best_size)
+        {
+            best = region.GetBase();
+            best_size = region.GetSize();
+        }
     }
 
-    throw std::runtime_error(
-        "find_remapped_base failed to find remapped location");
+    if (best)
+    {
+        gLog << "Fallback remapped base: 0x" << std::hex
+            << reinterpret_cast<std::uintptr_t>(best)
+            << " size: 0x" << best_size << std::endl;
+        return best;
+    }
+
+    // Last resort: unpack in-place — force the original image writable so
+    // repair_binary / IAT rebuild can patch it (beta often has no RW remap).
+    {
+        gLog << "No remapped RW image found; making original writable 0x"
+            << std::hex << reinterpret_cast<std::uintptr_t>(base)
+            << " size 0x" << image_size << std::endl;
+
+        auto cursor = reinterpret_cast<std::uint8_t *>(base);
+        auto const end = cursor + image_size;
+        while (cursor < end)
+        {
+            MEMORY_BASIC_INFORMATION mbi {};
+            if (!::VirtualQuery(cursor, &mbi, sizeof(mbi)))
+                break;
+
+            auto const region_end =
+                reinterpret_cast<std::uint8_t *>(mbi.BaseAddress) +
+                mbi.RegionSize;
+            auto const patch_end = (std::min)(region_end, end);
+            auto const patch_size = static_cast<SIZE_T>(patch_end - cursor);
+
+            if (mbi.State == MEM_COMMIT && patch_size)
+            {
+                DWORD old_protect = 0;
+                if (!::VirtualProtect(cursor, patch_size,
+                        PAGE_EXECUTE_READWRITE, &old_protect))
+                {
+                    gLog << "  VirtualProtect failed at 0x" << std::hex
+                        << reinterpret_cast<std::uintptr_t>(cursor)
+                        << " err=" << std::dec << ::GetLastError()
+                        << std::endl;
+                }
+            }
+
+            cursor = region_end;
+        }
+
+        return base;
+    }
 }
 
 void repair_binary(const fs::path &path, const hadesmem::Process &process,

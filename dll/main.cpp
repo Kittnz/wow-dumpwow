@@ -69,6 +69,22 @@ extern "C" __declspec(dllexport) void Initialize(
     }
 }
 
+// Post-decrypt dump entry for the external launcher (Eidolon already ran).
+// Resolves obfuscated IAT stubs and rebuilds a clean import directory.
+extern "C" __declspec(dllexport) void DumpNow(PVOID wow_base, DWORD wow_size)
+{
+    try
+    {
+        do_dump(wow_base, wow_size);
+    }
+    catch (const std::exception &e)
+    {
+        std::wstringstream str;
+        str << "DumpNow failed: " << e.what();
+        ::MessageBox(nullptr, str.str().c_str(), L"Unpacker", 0);
+    }
+}
+
 void HookCallTLSCallbacks(const hadesmem::Process &process, size_t rva,
     DWORD main_thread_id)
 {
