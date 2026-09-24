@@ -5,6 +5,7 @@
 #include <winternl.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -335,6 +336,81 @@ ExportInfo const *lookup_export(std::vector<ModuleExports> const &mods,
     return nullptr;
 }
 
+// IAT slots sometimes hold a jmp thunk in front of the real export.
+bool follow_export_thunk(HANDLE hproc, std::uintptr_t &va)
+{
+    std::uint8_t code[16] {};
+    if (!rpm(hproc, va, code, sizeof(code)))
+        return false;
+    if (code[0] == 0xE9)
+    {
+        auto const rel = *reinterpret_cast<std::int32_t *>(code + 1);
+        va = va + 5 + static_cast<std::uintptr_t>(rel);
+        return true;
+    }
+    if (code[0] == 0xFF && code[1] == 0x25)
+    {
+        auto const rel = *reinterpret_cast<std::int32_t *>(code + 2);
+        std::uint64_t target = 0;
+        if (!rpm(hproc, va + 6 + rel, &target, 8) || !target)
+            return false;
+        va = static_cast<std::uintptr_t>(target);
+        return true;
+    }
+    return false;
+}
+
+ExportInfo named_rva_in_module(HANDLE hproc, std::uintptr_t va)
+{
+    ExportInfo info;
+    DWORD needed = 0;
+    ::EnumProcessModulesEx(hproc, nullptr, 0, &needed, LIST_MODULES_ALL);
+    std::vector<HMODULE> handles(needed / sizeof(HMODULE) + 1);
+    if (!::EnumProcessModulesEx(hproc, handles.data(),
+            static_cast<DWORD>(handles.size() * sizeof(HMODULE)), &needed,
+            LIST_MODULES_ALL))
+        return info;
+    auto const count = needed / sizeof(HMODULE);
+    for (DWORD i = 0; i < count; ++i)
+    {
+        MODULEINFO mi {};
+        if (!::GetModuleInformation(hproc, handles[i], &mi, sizeof(mi)))
+            continue;
+        auto const base = reinterpret_cast<std::uintptr_t>(mi.lpBaseOfDll);
+        if (va < base || va >= base + mi.SizeOfImage)
+            continue;
+        wchar_t path[MAX_PATH] {};
+        ::GetModuleFileNameExW(hproc, handles[i], path, MAX_PATH);
+        auto fname = std::filesystem::path(path).filename().string();
+        if (fname.empty())
+            fname = "unknown";
+        for (auto &c : fname)
+            c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+        char name[32];
+        std::snprintf(name, sizeof(name), "rva_%llx",
+            static_cast<unsigned long long>(va - base));
+        info.dll = std::move(fname);
+        info.name = name;
+        return info;
+    }
+    return info;
+}
+
+ExportInfo const *lookup_export_follow(HANDLE hproc,
+    std::vector<ModuleExports> const &mods, std::uintptr_t va)
+{
+    if (auto const *e = lookup_export(mods, va))
+        return e;
+    for (int n = 0; n < 4; ++n)
+    {
+        if (!follow_export_thunk(hproc, va))
+            break;
+        if (auto const *e = lookup_export(mods, va))
+            return e;
+    }
+    return nullptr;
+}
+
 std::uint32_t align_up(std::uint32_t v, std::uint32_t a)
 {
     return (v + a - 1) / a * a;
@@ -378,8 +454,8 @@ size_t rebuild_imports_remote(HANDLE hproc, std::uintptr_t actual_base,
         if (!val)
             continue;
 
-        // Already an export?
-        if (auto const *e = lookup_export(exports,
+        // Already an export, or a jmp thunk in front of one?
+        if (auto const *e = lookup_export_follow(hproc, exports,
                 static_cast<std::uintptr_t>(val)))
         {
             resolved.push_back({ slot_rva, *e });
@@ -400,9 +476,36 @@ size_t rebuild_imports_remote(HANDLE hproc, std::uintptr_t actual_base,
             continue;
         }
 
-        auto const *e = lookup_export(exports, static_cast<std::uintptr_t>(api));
+        auto const *e = lookup_export_follow(hproc, exports,
+            static_cast<std::uintptr_t>(api));
+        ExportInfo fallback;
         if (!e)
         {
+            fallback = named_rva_in_module(hproc, static_cast<std::uintptr_t>(api));
+            if (!fallback.name.empty())
+                e = &fallback;
+        }
+        if (!e)
+        {
+            std::uint8_t bytes[16] {};
+            ::ReadProcessMemory(hproc, reinterpret_cast<LPCVOID>(api), bytes,
+                sizeof(bytes), nullptr);
+            MEMORY_BASIC_INFORMATION mbi {};
+            wchar_t mapped[MAX_PATH] {};
+            if (::VirtualQueryEx(hproc, reinterpret_cast<LPCVOID>(api), &mbi,
+                    sizeof(mbi)))
+            {
+                ::GetMappedFileNameW(hproc, mbi.AllocationBase, mapped,
+                    MAX_PATH);
+            }
+            std::cerr << "IAT unresolved slot rva 0x" << std::hex << slot_rva
+                      << " val 0x" << val << " api 0x" << api;
+            if (mapped[0])
+                std::wcerr << L" map " << mapped;
+            std::cerr << " bytes";
+            for (auto b : bytes)
+                std::cerr << " " << std::hex << static_cast<unsigned>(b);
+            std::cerr << std::dec << std::endl;
             ++failed;
             continue;
         }

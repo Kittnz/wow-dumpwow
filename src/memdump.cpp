@@ -947,6 +947,18 @@ void undo_relocations(std::vector<std::uint8_t> &image,
             auto const eoff = entry & 0xFFF;
             if (etype == 0)
                 continue;
+            // Slots already rewritten to import-name RVAs must not be relocated.
+            if (etype == 10)
+            {
+                auto const target = page_rva + eoff;
+                if (target + 8 <= image.size())
+                {
+                    auto const cur = *reinterpret_cast<std::uint64_t *>(
+                        image.data() + target);
+                    if (cur && cur < image.size())
+                        continue;
+                }
+            }
             if (etype != IMAGE_REL_BASED_DIR64)
                 continue;
             auto const abs_off = page_rva + eoff;
